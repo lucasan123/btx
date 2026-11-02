@@ -1,0 +1,72 @@
+name: Remote verifier native macOS checks
+on:
+  push:
+    branches: [ci/rc-prover-macos-20261102-d1664e6b-v2]
+permissions:
+  contents: read
+concurrency:
+  group: rc-prover-macos-review-20261102
+  cancel-in-progress: true
+jobs:
+  native-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch immutable candidate and baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/source"
+          git -C "$RUNNER_TEMP/source" remote add origin https://github.com/lucasan123/btx.git
+          git -C "$RUNNER_TEMP/source" fetch --depth=1 origin d1664e6bc567c01a6e5bba7ec702582423b24121 7740583039e705898d341d7979a33d84aeff62ea
+          git -C "$RUNNER_TEMP/source" checkout --detach d1664e6bc567c01a6e5bba7ec702582423b24121
+          sw_vers
+          uname -m
+          c++ --version
+      - name: Native standalone regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/test-tmp"
+          export TMPDIR="$RUNNER_TEMP/test-tmp"
+          cmake -S "$RUNNER_TEMP/source/contrib/rc-prover" -B "$RUNNER_TEMP/build" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS=-Wall -Wextra -Werror"
+          cmake --build "$RUNNER_TEMP/build" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/build" -V --repeat until-fail:3
+      - name: CPU policy and actual-handler tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/source"
+          c++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter -I src contrib/rc-prover/replay_policy_test.cpp -o "$RUNNER_TEMP/policy-test"
+          "$RUNNER_TEMP/policy-test"
+          c++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter -I src -I src/univalue/include contrib/rc-prover/request_protocol_test.cpp src/arith_uint256.cpp src/uint256.cpp src/util/strencodings.cpp src/crypto/hex_base.cpp src/support/cleanse.cpp src/univalue/lib/univalue.cpp src/univalue/lib/univalue_get.cpp src/univalue/lib/univalue_read.cpp src/univalue/lib/univalue_write.cpp -o "$RUNNER_TEMP/protocol-test"
+          "$RUNNER_TEMP/protocol-test"
+      - name: Prove original ACL trigger and guard mutation fail
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,subprocess
+          root=Path(os.environ['RUNNER_TEMP'])
+          source=root/'source';package=source/'contrib/rc-prover'
+          baseline=root/'baseline-token';baseline.mkdir()
+          for name in ['token_file_test.cpp','token_file.h']:
+              data=subprocess.check_output(['git','show','7740583039e705898d341d7979a33d84aeff62ea:contrib/rc-prover/'+name],cwd=source)
+              (baseline/name).write_bytes(data)
+          def expect_acl_failure(folder):
+              exe=folder/'token-probe'
+              subprocess.run(['c++','-std=c++20','-Wall','-Wextra','-Werror',str(folder/'token_file_test.cpp'),'-o',str(exe)],check=True)
+              result=subprocess.run(['python3',str(package/'test_token_file.py'),str(exe)],capture_output=True,text=True)
+              print(result.stdout+result.stderr)
+              assert result.returncode != 0
+              assert 'CASE: macOS non-empty extended ACL: everyone allow read' in result.stdout
+          expect_acl_failure(baseline)
+          mutation=root/'mutation-token';mutation.mkdir()
+          for name in ['token_file_test.cpp','token_file.h','token_acl_apple.h']:
+              (mutation/name).write_bytes((package/name).read_bytes())
+          header=(mutation/'token_file.h').read_text()
+          assert header.count('    CheckAppleTokenAcl(fd);') == 1
+          (mutation/'token_file.h').write_text(header.replace('    CheckAppleTokenAcl(fd);','    // mutation: ACL guard removed'))
+          expect_acl_failure(mutation)
+          print('Original ACL trigger and removed-guard mutation detected natively')
+          PY
