@@ -1,0 +1,58 @@
+name: Verifier pending-limit regression on macOS
+on:
+  push:
+    branches: [ci/rc-prover-listener-cap-20261102-8ac5162e]
+permissions:
+  contents: read
+jobs:
+  listener-cap:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch tested revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/source"
+          git -C "$RUNNER_TEMP/source" remote add origin https://github.com/lucasan123/btx.git
+          git -C "$RUNNER_TEMP/source" fetch --depth=2 origin 8ac5162eda56168541ecc58b4c28a3a603d74752
+          git -C "$RUNNER_TEMP/source" checkout --detach 8ac5162eda56168541ecc58b4c28a3a603d74752
+          sw_vers
+          uname -m
+          c++ --version
+      - name: Check bounded listener and removed-limit control
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,subprocess,sys,shutil
+          root=Path(os.environ['RUNNER_TEMP'])
+          repo=root/'source';package=repo/'contrib/rc-prover'
+          def run(args,expected_failure=False):
+              r=subprocess.run(args,capture_output=True,text=True,timeout=35)
+              print(r.stdout+r.stderr,flush=True)
+              if expected_failure:
+                  assert r.returncode!=0 and 'AssertionError: full-slot backpressure missing or too slow:' in r.stderr
+              else:
+                  assert r.returncode==0
+          for case in ['correct','unlimited']:
+              folder=root/case;folder.mkdir()
+              for name in ['request_listener_test.cpp','request_listener.h','socket_io.h']:
+                  shutil.copyfile(package/name,folder/name)
+              if case=='unlimited':
+                  p=folder/'request_listener.h';s=p.read_text()
+                  old='const bool can_accept{m_pending.size() < MAX_PENDING};'
+                  assert s.count(old)==1
+                  p.write_text(s.replace(old,'const bool can_accept{true};'))
+              exe=folder/'listener'
+              run(['c++','-std=c++20','-O2','-Wall','-Wextra','-Werror','-pthread',str(folder/'request_listener_test.cpp'),'-o',str(exe)])
+              if case=='unlimited':
+                  previous=subprocess.check_output(['git','show','a12ae6faa48d9665d94070c09c5e9d19f8d705f4:contrib/rc-prover/test_request_listener.py'],cwd=repo)
+                  control=folder/'old_test.py';control.write_bytes(previous)
+                  print('CONTROL: old test misses removed pending limit',flush=True)
+                  run([sys.executable,str(control),str(exe)])
+              for i in range(3):
+                  print(f'{case} run {i+1}',flush=True)
+                  run([sys.executable,str(package/'test_request_listener.py'),str(exe)],case=='unlimited')
+          print('MACOS: correct listener passed 3/3; removed limit detected 3/3; old test missed it')
+          PY
